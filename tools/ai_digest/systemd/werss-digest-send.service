@@ -1,0 +1,10 @@
+[Unit]
+Description=Send due WeRSS grouped digests
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/projects/we-mp-rss/tools/ai_digest/digest.py --config %h/projects/we-mp-rss/tools/ai_digest/config.json send
+UMask=0077
+TimeoutStartSec=15min
+KillMode=control-group

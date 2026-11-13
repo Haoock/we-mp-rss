@@ -1,0 +1,10 @@
+[Unit]
+Description=Check WeRSS digest delivery schedules every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

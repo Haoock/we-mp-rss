@@ -1,0 +1,394 @@
+import hashlib
+import io
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from contextlib import closing, redirect_stdout
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import DigestError, clean_html, due_slot, load_config, load_env, process_lock
+from digest import active_groups, main, payload_size, prepare, send
+from providers import Summarizer, post_json, send_feishu
+from storage import Source, State, connect_readonly
+
+
+SUMMARY = "文章介绍了企业最新季度经营情况及其增长原因。\n- 营收为100亿元，同比增长20%。\n- 净利润达到10亿元，同比增长5%。\n- 数据对应2026年第三季度，后续计划仍以公告为准。"
+
+
+class FakeModel:
+    def __init__(self):
+        self.calls = []
+
+    def summarize(self, title, text):
+        self.calls.append((title, text))
+        return SUMMARY, {"input_tokens": 50, "output_tokens": 60}
+
+
+class DigestTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        self.source_path = self.root / "source" / "we_mp_rss.db"
+        self.source_path.parent.mkdir()
+        self.db = sqlite3.connect(self.source_path)
+        self.addCleanup(self.db.close)
+        self.db.executescript("""
+            CREATE TABLE message_tasks(id TEXT PRIMARY KEY,name TEXT,status INTEGER,mps_id TEXT);
+            CREATE TABLE feeds(id TEXT PRIMARY KEY,mp_name TEXT);
+            CREATE TABLE articles(id TEXT PRIMARY KEY,mp_id TEXT,title TEXT,url TEXT,
+                publish_time INTEGER,status INTEGER,has_content INTEGER,content TEXT);
+        """)
+        self.db.executemany("INSERT INTO feeds VALUES (?, ?)", [(x, "公众号" + x) for x in "ABCDEFGH"])
+        self.db.executemany("INSERT INTO message_tasks VALUES (?, ?, 1, ?)", [
+            ("tech", "科技新闻更新", json.dumps([{"id": x} for x in "ABC"])),
+            ("ai", "AI更新", json.dumps([{"id": x} for x in "GH"])),
+            ("stock", "股市更新", json.dumps([{"id": x} for x in "DEF"])),
+        ])
+        self.db.commit()
+        example = Path(__file__).resolve().parents[1] / "config.example.json"
+        raw = json.loads(example.read_text())
+        raw.update(source_db=str(self.source_path), state_dir=str(self.root / "state"))
+        for group, name in zip(raw["groups"], ("tech", "ai", "stock")):
+            group["task_id"] = name
+        self.config_path = self.root / "config.json"
+        self.config_path.write_text(json.dumps(raw))
+        self.cfg = load_config(self.config_path)
+        State.initialize(self.cfg["state_dir"], self.source_path, self.at(9, 0))
+        self.state = State(self.cfg["state_dir"])
+        self.addCleanup(self.state.close)
+        self.source = Source(self.source_path)
+        self.groups = active_groups(self.cfg, self.source)
+        self.env = {"FEISHU_WEBHOOK": "https://open.feishu.cn/open-apis/bot/v2/hook/test-only"}
+        self.model = FakeModel()
+        self.messages = []
+        self.output = io.StringIO()
+        self.stdout = redirect_stdout(self.output)
+        self.stdout.__enter__()
+        self.addCleanup(self.stdout.__exit__, None, None, None)
+
+    def at(self, hour, minute, second=0):
+        from zoneinfo import ZoneInfo
+        return datetime(2026, 11, 13, hour, minute, second, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+
+    def article(self, key, mp="A", ready=True, published=None, body="<p>正文：营收100亿元，同比增长20%。</p>"):
+        self.db.execute("INSERT INTO articles VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                        (key, mp, "标题" + key, "https://example.com/article/" + key,
+                         published or self.at(10, 1), int(ready), body if ready else None))
+        self.db.commit()
+
+    def run_prepare(self, minute=22, **kwargs):
+        return prepare(self.cfg, self.source, self.state, self.groups, self.model, self.at(10, minute), **kwargs)
+
+    def run_send(self, minute=30, hour=10, sender=None, **kwargs):
+        return send(self.cfg, self.source, self.state, self.groups, self.env, self.at(hour, minute),
+                    sender=sender or (lambda group, env, text, now: self.messages.append((group["task_id"], text))), **kwargs)
+
+    def test_no_content_and_other_groups_never_call_model(self):
+        self.article("waiting", ready=False)
+        self.article("excluded", mp="Z")
+        result = self.run_prepare()
+        self.assertEqual(result["waiting"], 1)
+        self.assertEqual(self.model.calls, [])
+
+    def test_schedules_grouping_and_restart_dedup(self):
+        self.article("a")
+        self.article("g", "G")
+        self.article("d", "D")
+        self.run_prepare()
+        self.run_prepare()
+        self.assertEqual(len(self.model.calls), 3)
+        self.run_send(29)
+        self.assertEqual(self.messages, [])
+        self.run_send(30)
+        self.assertEqual([g for g, text in self.messages], ["tech"])
+        self.run_send(33)
+        self.run_send(36)
+        self.assertEqual([g for g, text in self.messages], ["tech", "ai", "stock"])
+        with closing(State(self.cfg["state_dir"])) as restarted:
+            send(self.cfg, self.source, restarted, self.groups, self.env, self.at(11, 30),
+                 sender=lambda *args: self.fail("re-sent after restart"))
+        self.assertNotIn("公众号G", self.messages[0][1])
+
+    def test_multiple_articles_not_just_latest_and_late_content(self):
+        self.article("older", ready=False, published=self.at(9, 30))
+        self.article("new1")
+        self.article("new2")
+        self.run_prepare()
+        self.run_send()
+        self.assertIn("new1", self.messages[0][1])
+        self.assertIn("new2", self.messages[0][1])
+        self.db.execute("UPDATE articles SET content='<p>较早文章的完整正文，收入20亿元。</p>',has_content=1 WHERE id='older'")
+        self.db.commit()
+        self.run_prepare(42)
+        self.run_send(42)
+        self.assertEqual(len(self.messages), 1)
+        self.run_send(30, hour=11)
+        self.assertIn("older", self.messages[1][1])
+        self.assertNotIn("new1", self.messages[1][1])
+
+    def test_empty_slot_is_closed_and_later_arrival_waits(self):
+        self.run_send()
+        self.article("late")
+        self.run_prepare(31)
+        self.run_send(31)
+        self.assertEqual(self.messages, [])
+        self.run_send(30, hour=11)
+        self.assertEqual(len(self.messages), 1)
+
+    def test_send_failure_retries_cached_message_outside_schedule(self):
+        self.article("a")
+        self.run_prepare()
+        def fail(*args):
+            raise DigestError("模拟网络失败")
+        self.run_send(sender=fail)
+        self.run_prepare(40)
+        self.run_send(40)
+        self.run_send(41)
+        self.assertEqual(len(self.model.calls), 1)
+        self.assertEqual(len(self.messages), 1)
+
+    def test_partial_split_retry_does_not_repeat_successful_parts(self):
+        self.cfg["message_max_bytes"] = 2000
+        for i in range(5):
+            self.article(str(i))
+        self.run_prepare()
+        attempts = []
+        def partial(group, env, text, now):
+            attempts.append(text)
+            if len(attempts) == 2:
+                raise DigestError("模拟第二段失败")
+        self.run_send(sender=partial)
+        count = self.state.db.execute("SELECT count(*) FROM messages").fetchone()[0]
+        self.assertGreater(count, 1)
+        self.run_send(40, sender=partial)
+        self.assertEqual(attempts.count(attempts[0]), 1)
+        self.assertEqual(attempts.count(attempts[1]), 2)
+        self.assertTrue(all(payload_size(text) < 2000 for text in attempts))
+
+    def test_same_article_reuses_summary_across_groups(self):
+        self.db.execute("UPDATE message_tasks SET mps_id=? WHERE id='ai'", (json.dumps([{"id": "A"}]),))
+        self.db.commit()
+        self.groups = active_groups(self.cfg, self.source)
+        self.article("shared")
+        self.run_prepare()
+        self.run_send()
+        self.run_send(33)
+        self.assertEqual(len(self.model.calls), 1)
+        self.assertEqual(len(self.messages), 2)
+
+    def test_disabled_and_empty_groups_do_not_select_all(self):
+        self.db.execute("UPDATE message_tasks SET mps_id='[]' WHERE id='tech'")
+        self.db.execute("UPDATE message_tasks SET status=0 WHERE id='ai'")
+        self.db.commit()
+        groups, problems = self.source.groups(self.cfg["groups"])
+        self.assertEqual([g["task_id"] for g in groups], ["stock"])
+        self.assertEqual(len(problems), 1)
+
+    def test_membership_change_cancels_stale_pending_message(self):
+        self.article("a")
+        self.run_prepare()
+        self.run_send(sender=lambda *args: (_ for _ in ()).throw(DigestError("失败")))
+        self.db.execute("UPDATE message_tasks SET mps_id=? WHERE id='tech'", (json.dumps([{"id": "B"}]),))
+        self.db.commit()
+        self.groups = active_groups(self.cfg, self.source)
+        result = self.run_send(40)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(self.messages, [])
+
+    def test_source_readonly_and_no_source_changes(self):
+        self.article("a")
+        before = hashlib.sha256(self.source_path.read_bytes()).digest()
+        with closing(connect_readonly(self.source_path)) as db:
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute("DELETE FROM articles")
+        self.run_prepare()
+        self.run_send()
+        self.assertEqual(before, hashlib.sha256(self.source_path.read_bytes()).digest())
+
+    def test_reading_live_wal_sees_committed_content(self):
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.article("wal", ready=False)
+        self.db.execute("UPDATE articles SET content='<p>已补齐的正文</p>',has_content=1 WHERE id='wal'")
+        self.assertIsNone(self.source.content("wal"))
+        self.db.commit()
+        self.assertEqual(self.source.content("wal"), "<p>已补齐的正文</p>")
+        self.run_prepare()
+        self.assertEqual(len(self.model.calls), 1)
+
+    def test_dry_run_has_no_external_calls_or_state_mutations(self):
+        self.article("a")
+        self.run_prepare(dry_run=True)
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(self.state.summaries(), {})
+        self.run_prepare()
+        self.run_send(dry_run=True, immediate=True)
+        self.assertEqual(self.messages, [])
+        self.assertEqual(self.state.db.execute("SELECT count(*) FROM slots").fetchone()[0], 0)
+
+    def test_model_failures_are_bounded_and_manual_retry_preserves_cache(self):
+        self.article("bad")
+        self.model.summarize = Mock(side_effect=DigestError("模型失败"))
+        for minute in (22, 25, 30, 40):
+            self.run_prepare(minute)
+        self.assertEqual(self.model.summarize.call_count, 3)
+        self.state.retry("summary")
+        self.run_prepare(41)
+        self.assertEqual(self.model.summarize.call_count, 4)
+
+    def test_long_input_is_not_silently_truncated_or_sent(self):
+        self.cfg["model"]["max_input_chars"] = 5
+        self.article("long")
+        self.run_prepare()
+        self.assertEqual(self.model.calls, [])
+        self.assertIn("未截断", self.state.summaries()["long"]["last_error"])
+
+    def test_cli_dry_run_and_status_do_not_need_credentials(self):
+        self.article("a")
+        for command in (["prepare", "--dry-run"], ["send", "--now", "--dry-run"], ["status"]):
+            self.assertEqual(main(["--config", str(self.config_path), *command]), 0, self.output.getvalue())
+
+    def test_initialize_does_not_reset_baseline(self):
+        self.assertFalse(State.initialize(self.cfg["state_dir"], self.source_path, self.at(11, 0)))
+        self.assertEqual(float(self.state.meta("since")), self.at(9, 0))
+
+    def test_send_retry_limit_and_manual_reset(self):
+        self.article("a")
+        self.run_prepare()
+        self.cfg["send_max_attempts"] = 2
+        sender = Mock(side_effect=DigestError("飞书故障"))
+        for minute in (30, 40, 50):
+            self.run_send(minute, sender=sender)
+        self.assertEqual(sender.call_count, 2)
+        self.state.retry("send")
+        self.run_send(51)
+        self.assertEqual(len(self.messages), 1)
+        self.assertEqual(len(self.model.calls), 1)
+
+    def test_destination_change_does_not_reuse_stale_pending_message(self):
+        self.article("a")
+        self.run_prepare()
+        self.run_send(sender=lambda *args: (_ for _ in ()).throw(DigestError("失败")))
+        self.env["FEISHU_WEBHOOK"] = "https://open.feishu.cn/open-apis/bot/v2/hook/new-target"
+        self.assertEqual(self.run_send(40)["cancelled"], 1)
+        self.run_send(30, hour=11)
+        self.assertEqual(len(self.messages), 1)
+
+    def test_cli_process_smoke_with_fake_executable(self):
+        self.article("smoke")
+        executable = self.root / "fake-claude"
+        executable.write_text('#!' + sys.executable + '\nimport json,sys\n'
+            'article=json.load(sys.stdin)\nassert "article" in article\n'
+            'assert sys.argv[sys.argv.index("--tools")+1] == ""\n'
+            'print(' + repr(json.dumps({"subtype": "success", "result": SUMMARY})) + ')\n')
+        executable.chmod(0o700)
+        raw = json.loads(self.config_path.read_text())
+        raw["model"]["provider"] = "claude_cli"
+        raw["model"]["claude_command"] = str(executable)
+        self.config_path.write_text(json.dumps(raw))
+        entry = str(Path(__file__).resolve().parents[1] / "digest.py")
+        command = [sys.executable, entry, "--config", str(self.config_path)]
+        for operation in (["prepare", "--limit", "1"], ["prepare", "--limit", "1"],
+                          ["send", "--group", "tech", "--now", "--dry-run"]):
+            result = subprocess.run(command + operation, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.state.summaries()["smoke"]["attempts"], 1)
+        self.assertEqual(self.state.db.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
+
+    def test_independent_locks(self):
+        with process_lock(self.cfg["state_dir"], "prepare") as first:
+            with process_lock(self.cfg["state_dir"], "prepare") as second:
+                with process_lock(self.cfg["state_dir"], "send") as sender:
+                    self.assertTrue(first)
+                    self.assertFalse(second)
+                    self.assertTrue(sender)
+
+
+class PureTests(unittest.TestCase):
+    def test_minimax_default_uses_subscription_key_and_ignores_thinking(self):
+        config = load_config(Path(__file__).resolve().parents[1] / "config.example.json")
+        model = Summarizer(config["model"], {"MINIMAX_API_KEY": "subscription-test-key"})
+        with patch("providers.post_json", return_value={"stop_reason": "end_turn", "content": [
+            {"type": "thinking", "thinking": "不要推送的思考内容"},
+            {"type": "text", "text": SUMMARY}]} ) as post:
+            summary, _ = model.summarize("标题", "正文")
+            self.assertEqual(post.call_args.args[0], "https://api.minimax.cn/anthropic/v1/messages")
+            self.assertEqual(post.call_args.args[2]["x-api-key"], "subscription-test-key")
+            self.assertEqual(post.call_args.args[1]["model"], "MiniMax-M3")
+            self.assertEqual(summary, SUMMARY)
+
+    def test_clean_html_preserves_numbers_and_removes_noise(self):
+        html = '<style>bad</style><p>营收100亿元 &amp; 增长20%</p><video>播放器</video><br>关注<div>利润10亿元</div><script>bad</script><p>证券时报各平台所有原创内容说明</p><p>版权尾部</p>'
+        self.assertEqual(clean_html(html), '营收100亿元 & 增长20%\n利润10亿元')
+
+    def test_schedule_timezone_grace_and_hour_rollover(self):
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Asia/Shanghai")
+        now = datetime(2026, 11, 13, 0, 1, tzinfo=tz).timestamp()
+        self.assertEqual(due_slot(now, [59], tz, 300), "2026-11-12T23:59:00+08:00")
+        self.assertIsNone(due_slot(now, [30], tz, 300))
+
+    def test_env_file_is_not_executed_and_environment_wins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text('EXAMPLE_KEY="$(touch /must-not-exist)"\nEXAMPLE_OVERRIDE=file\n')
+            with patch.dict(os.environ, {"EXAMPLE_OVERRIDE": "environment"}):
+                env = load_env(path)
+                self.assertEqual(env["EXAMPLE_KEY"], "$(touch /must-not-exist)")
+                self.assertEqual(env["EXAMPLE_OVERRIDE"], "environment")
+
+    def test_feishu_business_failure_and_signing(self):
+        group = {"webhook_env": "HOOK", "sign_secret_env": "SIGN"}
+        env = {"HOOK": "https://open.feishu.cn/open-apis/bot/v2/hook/test-only", "SIGN": "test-secret"}
+        with patch("providers.post_json", return_value={"code": 19024}) as post:
+            with self.assertRaises(DigestError):
+                send_feishu(group, env, "message", 1234)
+            body = post.call_args.args[1]
+            self.assertEqual(body["timestamp"], "1234")
+            self.assertTrue(body["sign"])
+        with patch("providers.post_json", return_value={"code": 0}):
+            send_feishu(group, env, "message", 1234)
+
+    def test_anthropic_sends_only_prompt_and_article(self):
+        model = Summarizer({"provider": "anthropic", "name": "test-model", "api_url": "https://api.anthropic.com/v1/messages",
+            "max_output_tokens": 1600, "max_input_chars": 60000, "timeout_seconds": 30},
+            {"ANTHROPIC_API_KEY": "test-key", "FEISHU_WEBHOOK": "must-not-be-in-prompt"})
+        with patch("providers.post_json", return_value={"stop_reason": "end_turn", "content": [{"type": "text", "text": SUMMARY}],
+                                                      "usage": {"input_tokens": 123}}) as post:
+            summary, usage = model.summarize("标题", "正文")
+            body = post.call_args.args[1]
+            self.assertEqual(summary, SUMMARY)
+            self.assertEqual(usage["input_tokens"], 123)
+            self.assertEqual(len(body["messages"]), 1)
+            self.assertNotIn("tools", body)
+            self.assertNotIn("must-not-be-in-prompt", json.dumps(body))
+        with patch("providers.post_json", return_value={"stop_reason": "max_tokens"}):
+            with self.assertRaises(DigestError):
+                model.summarize("标题", "正文")
+
+    def test_claude_uses_stdin_no_tools_and_no_webhook_env(self):
+        model = Summarizer({"provider": "claude_cli", "max_input_chars": 60000,
+                            "max_output_tokens": 1600, "timeout_seconds": 30},
+                           {"PATH": "/usr/bin", "HOME": "/test", "FEISHU_WEBHOOK": "secret"})
+        process = Mock(returncode=0)
+        process.communicate.return_value = (json.dumps({"subtype": "success", "result": SUMMARY}), "")
+        with patch("providers.shutil.which", return_value="/test/claude"), patch("providers.subprocess.Popen", return_value=process) as popen:
+            model.summarize("标题", "全文正文")
+            args = popen.call_args.args[0]
+            self.assertEqual(args[args.index("--tools") + 1], "")
+            self.assertIn("--safe-mode", args)
+            self.assertNotIn("--continue", args)
+            self.assertNotIn("FEISHU_WEBHOOK", popen.call_args.kwargs["env"])
+            self.assertIn("全文正文", process.communicate.call_args.args[0])
+            self.assertFalse(Path(popen.call_args.kwargs["cwd"]).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

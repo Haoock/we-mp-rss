@@ -1,0 +1,10 @@
+[Unit]
+Description=Check new WeRSS article content every two minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/2:00
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
