@@ -78,7 +78,8 @@ FEISHU_WEBHOOK=你的飞书机器人地址
 
 ```json
 "provider": "anthropic",
-"name": "MiniMax-M3",
+"name": "MiniMax-M3.1-Flash",
+"effort": "low",
 "api_url": "https://api.minimax.cn/anthropic/v1/messages",
 "api_key_env": "MINIMAX_API_KEY"
 ```
@@ -89,11 +90,11 @@ FEISHU_WEBHOOK=你的飞书机器人地址
 MINIMAX_API_KEY=你的国内订阅Key
 ```
 
-根据当前 [MiniMax 官方接口文档](https://platform.minimax.cn/docs/api-reference/text-anthropic-api)，国内域名为 `api.minimax.cn`；默认模型 `MiniMax-M3` 默认不启用 thinking，适合先验证纯摘要流程。具体订阅是否开放该模型、剩余额度及适用调用范围，以你的订阅控制台为准；脚本不会改用普通按量 Key 或自动切换 CLI。尚未使用真实 Key 验证。
+根据当前 [MiniMax 官方接口文档](https://platform.minimax.cn/docs/api-reference/text-anthropic-api)，国内域名为 `api.minimax.cn`；默认模型为 `MiniMax-M3.1-Flash`，通过 `output_config.effort=low` 降低思考强度，输出上限为 4096 tokens。Flash 必须开启思考，不能设置为 disabled。具体订阅是否开放该模型、剩余额度及适用调用范围，以你的订阅控制台为准；脚本不会改用普通按量 Key 或自动切换 CLI。尚未使用真实 Key 验证。
 
 若已复制过旧示例，需要同步修改现有 `config.json` 的上述字段，单独更新示例不会覆盖你的配置。切换备用 CLI 时将 `provider` 改为 `claude_cli`，将 `name` 清空或改为该 CLI 可用的模型；不要直接沿用 MiniMax 模型名调用默认 Claude 服务。
 
-MiniMax 返回的 thinking 块不会被推送，只提取 text 摘要。若改用强制思考模型，思考也可能消耗输出预算；遇到 `max_tokens` 会记录失败，不把截断结果当成成功。
+MiniMax 返回的 thinking 块不会被推送，只提取 text 摘要。若改用强制思考模型，思考也可能消耗输出预算；遇到 `max_tokens` 会记录失败并暂停该篇自动重试，不把截断结果当成成功。
 
 **备用方式：沿用 Claude Code（手动切换，不自动降级）。**
 
@@ -122,7 +123,7 @@ MiniMax 返回的 thinking 块不会被推送，只提取 text 摘要。若改�
 "api_version": "2023-06-01"
 ```
 
-在 `.env` 填写 `ANTHROPIC_API_KEY`。程序用 HTTPS POST 发送 `system + 一条 user 消息`，不附带工具、历史聊天或操作说明，读取返回摘要和 token 用量。每篇单独请求；默认最大输出 1600 tokens。API 使用账户独立计费，不假定包含在 Claude Code 订阅里。
+在 `.env` 填写 `ANTHROPIC_API_KEY`。程序用 HTTPS POST 发送 `system + 一条 user 消息`，不附带工具、历史聊天或操作说明，读取返回摘要和 token 用量。每篇单独请求；示例最大输出 4096 tokens（思考模型的思考也占用此预算）。使用其他服务时，应确认其支持 `output_config.effort`，否则从配置中移除此字段；省略时脚本不会发送这个参数。API 使用账户独立计费，不假定包含在 Claude Code 订阅里。
 
 只实现了 **Anthropic Messages 协议**，并非任意模型 API 协议。兼容服务需要支持相同请求/响应格式和 `end_turn` 结束原因，修改 `api_url` 后应先小批量验证。地址必须是 HTTPS，不跟随重定向。
 
@@ -186,7 +187,23 @@ journalctl --user -u werss-digest-send.service -n 50 --no-pager
 
 日志为 JSON 行：`prepare_finished` 包含等待正文数、模型调用次数、缓存命中数和失败数；`summary_saved` 包含模型返回的 token 用量；`slot_created` 记录某轮推送的篇数；`message_sent` 表示飞书返回 HTTP 200 且业务 `code=0`，`send_failed` 表示待重试。CLI 的 token 统计可能包括额外上下文和缓存量，不等于 API 账单。
 
-默认每轮最多调用模型 5 篇、每组每个推送时间最多 20 篇，超出部分留到后续轮次。正文尚未就绪时不会调用模型。摘要默认失败 3 次、消息失败 5 次后暂停自动尝试；退避从 120 秒开始翻倍，上限 1 小时。修复原因后可以重置失败记录：
+默认每轮最多调用模型 5 篇、每组每个推送时间最多 20 篇，超出部分留到后续轮次。正文尚未就绪时不会调用模型。消息默认失败 5 次后暂停自动尝试；退避从 120 秒开始翻倍，上限 1 小时。
+
+摘要失败按类型处理：
+
+| 类别 | 自动处理 |
+| --- | --- |
+| `output_limit` / `stop_reason=max_tokens` | 暂停该篇，调整 effort/预算后手动重试 |
+| `transport`：网络异常、HTTP 408/429/5xx | 退避重试，默认最多 3 次 |
+| `response_format`：响应或摘要格式不合要求 | 有限重试，默认最多 3 次 |
+| `configuration` / `api_configuration`：本地配置、HTTP 401/403/400/404 等非暂时错误 | 暂停该篇并停止本轮后续模型调用 |
+| `empty_content` / `input_limit` / 其他异常结束原因 | 暂停该篇，人工检查 |
+
+停止本轮不等于关闭定时器；下一轮仍可能尝试其他尚未处理的文章。若为全局密钥/模型配置问题，修复前可先停止 prepare.timer，避免后续轮次继续失败。摘要程序不自动提高预算、不自动切换模型或 CLI。
+
+成功和失败的模型请求日志都包含 `model`、`effort`、`max_output_tokens`、`stop_reason`、`usage`、`elapsed_ms`、`has_text`；没有收到响应时，结束原因是 null、usage 为空，不代表实际消耗一定为零。未知结束原因显示 unknown，原始错误响应、正文、思考内容和 Key 均不写入日志。`status` 的 `summary_error.diagnostics` 可查看持久化的失败诊断及 `blocked` 标记。成功摘要继续复用原缓存。
+
+预算耗尽后的暂停记录不会因为下一轮到来或提高重试次数上限而自动恢复。同一篇正文变化后会作为新的输入尝试；配置调整后则需要显式重置：
 
 ```bash
 python3 digest.py retry summary
@@ -224,3 +241,16 @@ python3 -m unittest discover -s tools/ai_digest/tests -v
 测试使用临时数据，不调用真实模型，不发送飞书，不连接真实 WeRSS 数据库。覆盖分组时间、晚到正文、批量文章、去重、重启、正文清洗、只读源库、摘要缓存、推送失败、分段重试和两种模型接口。
 
 接口参考：[MiniMax 国内 API](https://platform.minimax.cn/docs/api-reference/text-anthropic-api)、[Claude Code CLI](https://code.claude.com/docs/en/cli-reference)、[非交互调用](https://code.claude.com/docs/en/headless)、[Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)、[飞书自定义机器人](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)。
+
+## 从旧版升级低思考强度与诊断功能
+
+只需更新本目录代码，不用重新 init，不用清理或迁移状态库。失败诊断复用既有 `usage_json` 字段，成功摘要和推送记录保留。
+
+1. 暂停新的摘要触发：`systemctl --user stop werss-digest-prepare.timer`。
+2. 等当前 `prepare.service` 结束再更新代码；暂停 timer 不会中断当前模型请求。
+3. 修改云端实际 `config.json` 的 model：`name` 为 `MiniMax-M3.1-Flash`，新增 `effort: "low"`，先用 `max_output_tokens: 4096`。JSON 字段需用双引号，其他字段保持原值。更新 example 不会自动修改 config.json。
+4. `python3 digest.py check`，然后 `python3 digest.py retry summary` 解除之前失败文章的暂停/次数限制（仅重置没有成功摘要的记录）。
+5. `python3 digest.py prepare --limit 1`：这是实际调用，会消耗订阅额度。查看日志中的 effort、结束原因、耗时、token；可用 `send --now --dry-run` 预览摘要并人工核对关键数字。先验证少量文章，不立即批量提高输出预算。
+6. 验证后 `systemctl --user start werss-digest-prepare.timer`。service/timer 文件未改变，不需要 daemon-reload。
+
+模拟测试只能验证调用参数和重试逻辑，实际摘要质量和 token 节省幅度需要用你的云端 Key、小批量文章验证。失败批次仍返回非零退出码以便监控；systemd 显示 FAILURE 时，要结合 `prepare_finished` 的成功/失败篇数判断，已成功摘要不会丢失。

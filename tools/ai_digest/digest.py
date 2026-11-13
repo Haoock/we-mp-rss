@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from common import DigestError, clean_html, due_slot, load_config, load_env, process_lock
-from providers import Summarizer, send_feishu, target_hash, webhook_url
+from providers import ModelError, Summarizer, send_feishu, target_hash, webhook_url
 from storage import Source, State
 
 
@@ -36,6 +36,7 @@ def backoff(cfg, attempts):
 
 
 def prepare(cfg, source, state, groups, summarizer, now, limit=None, dry_run=False):
+    run_started = time.monotonic()
     cache = state.summaries()
     mp_ids = set().union(*(group["mp_ids"] for group in groups))
     articles = source.articles(mp_ids, float(state.meta("since")))
@@ -52,8 +53,10 @@ def prepare(cfg, source, state, groups, summarizer, now, limit=None, dry_run=Fal
         text = clean_html(source.content(article["id"]))
         digest = hashlib.sha256((article["title"] + "\n" + text).encode()).hexdigest()
         previous_attempts = old.get("attempts", 0) if old.get("input_hash") == digest else 0
+        diagnostics = json.loads(old.get("usage_json") or "{}")
         if old.get("input_hash") == digest and (
-            previous_attempts >= cfg["summary_max_attempts"] or old.get("next_retry", 0) > now
+            diagnostics.get("blocked", False) or previous_attempts >= cfg["summary_max_attempts"]
+            or old.get("next_retry", 0) > now
         ):
             counts["deferred"] += 1
             continue
@@ -69,19 +72,33 @@ def prepare(cfg, source, state, groups, summarizer, now, limit=None, dry_run=Fal
             continue
         try:
             if not text:
-                raise DigestError("清洗后正文为空")
+                raise ModelError("清洗后正文为空", "empty_content", False)
             if len(text) + len(article["title"]) > cfg["model"]["max_input_chars"]:
-                raise DigestError("正文超过 max_input_chars；未截断、未调用模型")
+                raise ModelError("正文超过 max_input_chars；未截断、未调用模型", "input_limit", False)
             counts["calls"] += 1
             summary, usage = summarizer.summarize(article["title"], text)
             state.success(article["id"], digest, summary, usage, now)
             counts["summarized"] += 1
-            report("summary_saved", article_id=article["id"], title=article["title"], usage=usage)
+            report("summary_saved", article_id=article["id"], title=article["title"],
+                   **dict(getattr(summarizer, "last_diagnostics", {}), usage=usage))
         except DigestError as error:
             attempts = previous_attempts + 1
-            state.failure(article["id"], digest, attempts, str(error), now, backoff(cfg, attempts))
+            details = {
+                "provider": cfg["model"]["provider"], "model": cfg["model"].get("name", ""),
+                "effort": cfg["model"].get("effort") if cfg["model"]["provider"] == "anthropic" else None,
+                "max_output_tokens": cfg["model"]["max_output_tokens"],
+                "stop_reason": None, "usage": {}, "has_text": False, "elapsed_ms": 0,
+                **getattr(error, "diagnostics", {}),
+            }
+            details.update(category=getattr(error, "category", "unknown"),
+                           blocked=not getattr(error, "retryable", True))
+            completed_at = now + (time.monotonic() - run_started)
+            state.failure(article["id"], digest, attempts, str(error), completed_at, backoff(cfg, attempts), details)
             counts["failed"] += 1
-            report("summary_failed", article_id=article["id"], error=str(error), attempts=attempts)
+            report("summary_failed", article_id=article["id"], error=str(error), attempts=attempts, **details)
+            if getattr(error, "abort_batch", False):
+                report("prepare_aborted", reason="模型配置或访问错误，停止本轮后续调用")
+                break
     report("prepare_finished", dry_run=dry_run, **counts)
     return counts
 
@@ -190,9 +207,11 @@ def show_status(cfg, source, state, groups):
                waiting_content=sum(not article["ready"] for article in articles),
                ready_to_send=sum(bool(cache.get(a["id"], {}).get("summary"))
                                  and a["ready"] and a["id"] not in used for a in articles))
-    for row in state.db.execute("""SELECT article_id, attempts, last_error FROM summaries
+    for row in state.db.execute("""SELECT article_id, attempts, last_error, usage_json FROM summaries
         WHERE summary IS NULL AND last_error IS NOT NULL"""):
-        report("summary_error", **dict(row))
+        fields = dict(row)
+        fields["diagnostics"] = json.loads(fields.pop("usage_json") or "{}")
+        report("summary_error", **fields)
     for row in state.db.execute("""SELECT id, group_id, attempts, next_retry, last_error
         FROM messages WHERE status='pending'"""):
         report("pending_message", **dict(row))

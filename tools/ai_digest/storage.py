@@ -154,15 +154,16 @@ class State:
                     updated_at=excluded.updated_at""",
                 (article_id, input_hash, summary, json.dumps(usage), now))
 
-    def failure(self, article_id, input_hash, attempts, error, now, delay):
+    def failure(self, article_id, input_hash, attempts, error, now, delay, diagnostics=None):
         with self.db:
             self.db.execute("""INSERT INTO summaries
-                (article_id, input_hash, attempts, last_error, updated_at, next_retry)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (article_id, input_hash, attempts, last_error, updated_at, next_retry, usage_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(article_id) DO UPDATE SET input_hash=excluded.input_hash,
                     attempts=excluded.attempts, last_error=excluded.last_error,
-                    updated_at=excluded.updated_at, next_retry=excluded.next_retry""",
-                (article_id, input_hash, attempts, error, now, now + delay))
+                    updated_at=excluded.updated_at, next_retry=excluded.next_retry,
+                    usage_json=excluded.usage_json""",
+                (article_id, input_hash, attempts, error, now, now + delay, json.dumps(diagnostics or {})))
 
     def delivered_or_queued(self, group_id):
         return {row[0] for row in self.db.execute(
@@ -211,6 +212,6 @@ class State:
         with self.db:
             if kind == "summary":
                 return self.db.execute("""UPDATE summaries SET attempts=0, next_retry=0,
-                    last_error=NULL WHERE summary IS NULL""").rowcount
+                    last_error=NULL, usage_json=NULL WHERE summary IS NULL""").rowcount
             return self.db.execute("""UPDATE messages SET attempts=0, next_retry=0,
                 last_error=NULL WHERE status='pending'""").rowcount

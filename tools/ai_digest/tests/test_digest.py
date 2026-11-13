@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import DigestError, clean_html, due_slot, load_config, load_env, process_lock
 from digest import active_groups, main, payload_size, prepare, send
-from providers import Summarizer, post_json, send_feishu
+from providers import ModelError, Summarizer, TransportError, post_json, send_feishu
 from storage import Source, State, connect_readonly
 
 
@@ -243,6 +243,50 @@ class DigestTests(unittest.TestCase):
         self.run_prepare(41)
         self.assertEqual(self.model.summarize.call_count, 4)
 
+    def test_output_limit_is_persistently_blocked_until_explicit_retry(self):
+        self.article("truncated")
+        model = Summarizer(self.cfg["model"], {"MINIMAX_API_KEY": "test-key"})
+        response = {"stop_reason": "max_tokens", "usage": {"input_tokens": 20, "output_tokens": 4096},
+                    "content": [{"type": "thinking", "thinking": "private-thinking"}]}
+        with patch("providers.post_json", return_value=response) as post:
+            prepare(self.cfg, self.source, self.state, self.groups, model, self.at(10, 22))
+            with closing(State(self.cfg["state_dir"])) as restarted:
+                prepare(self.cfg, self.source, restarted, self.groups, model, self.at(11, 22))
+            self.assertEqual(post.call_count, 1)
+            record = self.state.summaries()["truncated"]
+            diagnostics = json.loads(record["usage_json"])
+            self.assertEqual(record["attempts"], 1)
+            self.assertTrue(diagnostics["blocked"])
+            self.assertEqual(diagnostics["usage"]["output_tokens"], 4096)
+            self.assertEqual(diagnostics["stop_reason"], "max_tokens")
+            self.assertFalse(diagnostics["has_text"])
+            self.assertIn("elapsed_ms", diagnostics)
+            self.assertNotIn("private-thinking", self.output.getvalue())
+            self.assertNotIn("test-key", self.output.getvalue())
+            self.state.retry("summary")
+            post.return_value = {"stop_reason": "end_turn", "content": [{"type": "text", "text": SUMMARY}]}
+            prepare(self.cfg, self.source, self.state, self.groups, model, self.at(11, 24))
+            self.assertEqual(self.state.summaries()["truncated"]["summary"], SUMMARY)
+            self.assertEqual(post.call_count, 2)
+
+    def test_configuration_error_stops_batch_and_transient_error_does_not(self):
+        self.article("a")
+        self.article("b")
+        model = Summarizer(self.cfg["model"], {"MINIMAX_API_KEY": "key"})
+        with patch("providers.post_json", side_effect=TransportError("HTTP 状态 401", 401)) as post:
+            result = prepare(self.cfg, self.source, self.state, self.groups, model, self.at(10, 22))
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(len(self.state.summaries()), 1)
+        self.state.retry("summary")
+        with patch("providers.post_json", side_effect=TransportError("HTTP 状态 429", 429)) as post:
+            prepare(self.cfg, self.source, self.state, self.groups, model, self.at(10, 24))
+            self.assertEqual(post.call_count, 2)
+            prepare(self.cfg, self.source, self.state, self.groups, model, self.at(10, 25))
+            self.assertEqual(post.call_count, 2)
+            prepare(self.cfg, self.source, self.state, self.groups, model, self.at(10, 27))
+            self.assertEqual(post.call_count, 4)
+
     def test_long_input_is_not_silently_truncated_or_sent(self):
         self.cfg["model"]["max_input_chars"] = 5
         self.article("long")
@@ -321,8 +365,32 @@ class PureTests(unittest.TestCase):
             summary, _ = model.summarize("标题", "正文")
             self.assertEqual(post.call_args.args[0], "https://api.minimax.cn/anthropic/v1/messages")
             self.assertEqual(post.call_args.args[2]["x-api-key"], "subscription-test-key")
-            self.assertEqual(post.call_args.args[1]["model"], "MiniMax-M3")
+            self.assertEqual(post.call_args.args[1]["model"], "MiniMax-M3.1-Flash")
+            self.assertEqual(post.call_args.args[1]["output_config"], {"effort": "low"})
             self.assertEqual(summary, SUMMARY)
+
+    def test_invalid_effort_rejected_before_any_model_call(self):
+        path = Path(__file__).resolve().parents[1] / "config.example.json"
+        raw = json.loads(path.read_text())
+        raw["model"]["effort"] = "disabled"
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.json"
+            config.write_text(json.dumps(raw))
+            with self.assertRaises(DigestError):
+                load_config(config)
+
+    def test_api_format_failure_retains_usage_without_response_body(self):
+        cfg = load_config(Path(__file__).resolve().parents[1] / "config.example.json")
+        model = Summarizer(cfg["model"], {"MINIMAX_API_KEY": "key"})
+        with patch("providers.post_json", return_value={"stop_reason": "end_turn", "usage": {"output_tokens": 99},
+                "content": [{"type": "text", "text": "invalid-private-output"}]}):
+            with self.assertRaises(ModelError) as raised:
+                model.summarize("标题", "正文")
+        self.assertEqual(raised.exception.category, "response_format")
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(raised.exception.diagnostics["usage"]["output_tokens"], 99)
+        self.assertNotIn("invalid-private-output", json.dumps(raised.exception.diagnostics))
+        self.assertIn("elapsed_ms", raised.exception.diagnostics)
 
     def test_clean_html_preserves_numbers_and_removes_noise(self):
         html = '<style>bad</style><p>营收100亿元 &amp; 增长20%</p><video>播放器</video><br>关注<div>利润10亿元</div><script>bad</script><p>证券时报各平台所有原创内容说明</p><p>版权尾部</p>'
