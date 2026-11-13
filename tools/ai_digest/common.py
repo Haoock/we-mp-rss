@@ -55,6 +55,8 @@ def load_config(filename):
         if type(value) is not int or not lower <= value <= upper:
             raise DigestError(f"配置 {key} 必须为 {lower}～{upper} 的整数")
     model = cfg["model"]
+    if model.get("effort") is not None and model["effort"] not in ("low", "medium", "high", "xhigh", "max"):
+        raise DigestError("model.effort 必须是 low/medium/high/xhigh/max，或省略")
     if model["provider"] not in ("claude_cli", "anthropic"):
         raise DigestError("model.provider 仅支持 claude_cli 或 anthropic")
     for key, default in (("timeout_seconds", 180), ("max_input_chars", 60000),

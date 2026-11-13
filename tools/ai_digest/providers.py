@@ -9,11 +9,27 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from common import DigestError, PROMPT
+
+
+class TransportError(DigestError):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+class ModelError(DigestError):
+    def __init__(self, message, category, retryable=True, abort_batch=False):
+        super().__init__(message)
+        self.category = category
+        self.retryable = retryable
+        self.abort_batch = abort_batch
+        self.diagnostics = {}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -29,7 +45,7 @@ def post_json(url, body, headers=None, timeout=30):
     try:
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as response:
             if response.status != 200:
-                raise DigestError(f"HTTP 状态 {response.status}")
+                raise TransportError(f"HTTP 状态 {response.status}", response.status)
             raw = response.read(2 * 1024 * 1024 + 1)
             if len(raw) > 2 * 1024 * 1024:
                 raise DigestError("HTTP 响应超过大小限制")
@@ -39,9 +55,9 @@ def post_json(url, body, headers=None, timeout=30):
             return result
     except urllib.error.HTTPError as error:
         # Never log URLs, response bodies, or credentials, including on redirects.
-        raise DigestError(f"HTTP 状态 {error.code}") from None
+        raise TransportError(f"HTTP 状态 {error.code}", error.code) from None
     except (urllib.error.URLError, TimeoutError, OSError):
-        raise DigestError("网络连接失败或超时") from None
+        raise TransportError("网络连接失败或超时") from None
     except (ValueError, UnicodeError):
         raise DigestError("HTTP 响应不是有效 JSON") from None
 
@@ -67,6 +83,7 @@ class Summarizer:
     def __init__(self, config, env):
         self.cfg = config
         self.env = env
+        self.last_diagnostics = {}
 
     def cli_command(self):
         binary = shutil.which(self.cfg.get("claude_command", "claude"), path=self.env.get("PATH"))
@@ -117,20 +134,71 @@ class Summarizer:
         return env
 
     def summarize(self, title, text):
+        started = time.monotonic()
+        self.last_diagnostics = {
+            "provider": self.cfg["provider"], "model": self.cfg.get("name", ""),
+            "effort": self.cfg.get("effort") if self.cfg["provider"] == "anthropic" else None,
+            "max_output_tokens": self.cfg["max_output_tokens"],
+            "stop_reason": None, "usage": {}, "has_text": False,
+        }
+        try:
+            return self._summarize(title, text)
+        except DigestError as original:
+            error = original
+            if isinstance(original, TransportError):
+                status = original.status
+                transient = status is None or status in (408, 429) or status >= 500
+                error = ModelError(str(original), "transport" if transient else "api_configuration",
+                                   retryable=transient, abort_batch=not transient)
+                self.last_diagnostics["http_status"] = status
+            elif not isinstance(original, ModelError):
+                error = ModelError(str(original), "response_format")
+            self.last_diagnostics.update(category=error.category, blocked=not error.retryable,
+                                         abort_batch=error.abort_batch)
+            error.diagnostics = self.last_diagnostics
+            raise error from None
+        finally:
+            self.last_diagnostics["elapsed_ms"] = round((time.monotonic() - started) * 1000)
+
+    def _summarize(self, title, text):
         if len(title) + len(text) > self.cfg["max_input_chars"]:
-            raise DigestError("正文超过 max_input_chars；未截断、未调用模型，请人工检查")
+            raise ModelError("正文超过 max_input_chars；未截断、未调用模型，请人工检查", "input_limit", False)
         user_content = json.dumps({"title": title, "article": text}, ensure_ascii=False)
         if self.cfg["provider"] == "anthropic":
-            self.check()
-            result = post_json(self.cfg["api_url"], {
+            try:
+                self.check()
+            except DigestError as error:
+                raise ModelError(str(error), "configuration", False, True) from None
+            body = {
                 "model": self.cfg["name"], "max_tokens": self.cfg["max_output_tokens"],
                 "system": PROMPT, "messages": [{"role": "user", "content": user_content}],
-            }, {"x-api-key": self.env[self.cfg.get("api_key_env", "ANTHROPIC_API_KEY")],
+            }
+            if self.cfg.get("effort"):
+                body["output_config"] = {"effort": self.cfg["effort"]}
+            result = post_json(self.cfg["api_url"], body,
+                {"x-api-key": self.env[self.cfg.get("api_key_env", "ANTHROPIC_API_KEY")],
                 "anthropic-version": self.cfg.get("api_version", "2023-06-01")},
                 timeout=self.cfg["timeout_seconds"])
-            if result.get("stop_reason") != "end_turn":
-                raise DigestError("API 未正常完成摘要（可能输出截断）")
+            reason = result.get("stop_reason")
             content = result.get("content", [])
+            # Only whitelist diagnostic fields; never log provider messages or thinking text.
+            safe_reason = reason if isinstance(reason, str) and reason in {
+                "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn",
+                "refusal", "model_context_window_exceeded"} else (None if reason is None else "unknown")
+            self.last_diagnostics.update(stop_reason=safe_reason,
+                usage=numeric_usage(result.get("usage", {})),
+                has_text=isinstance(content, list) and any(isinstance(item, dict)
+                    and item.get("type") == "text" and bool(item.get("text")) for item in content))
+            if "error" in result:
+                detail = result["error"] if isinstance(result["error"], dict) else {}
+                kind = detail.get("type")
+                transient = kind in ("rate_limit_error", "overloaded_error", "api_error")
+                raise ModelError("API 返回错误对象（未记录原始响应）", "api_error",
+                                 transient, not transient)
+            if reason == "max_tokens":
+                raise ModelError("输出预算耗尽；暂停该篇，请调整 effort/预算后手动重试", "output_limit", False)
+            if reason != "end_turn":
+                raise ModelError("API 未正常完成摘要；请查看 stop_reason", "stop_reason", False)
             if not isinstance(content, list) or any(not isinstance(item, dict) for item in content):
                 raise DigestError("API 摘要响应格式无效")
             if any(not isinstance(item.get("text"), str) for item in content if item.get("type") == "text"):
@@ -165,6 +233,8 @@ class Summarizer:
             if not isinstance(result, dict) or result.get("is_error") or result.get("subtype") != "success":
                 raise DigestError("Claude Code 未成功完成摘要")
             summary = result.get("result")
+            self.last_diagnostics.update(stop_reason="end_turn", has_text=bool(summary),
+                                         usage=numeric_usage(result.get("usage", {})))
         return validate_summary(summary), numeric_usage(result.get("usage", {}))
 
 
