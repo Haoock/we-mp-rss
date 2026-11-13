@@ -1,0 +1,10 @@
+[Unit]
+Description=Prepare WeRSS article summaries
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/projects/we-mp-rss/tools/ai_digest/digest.py --config %h/projects/we-mp-rss/tools/ai_digest/config.json prepare
+UMask=0077
+TimeoutStartSec=20min
+KillMode=control-group
