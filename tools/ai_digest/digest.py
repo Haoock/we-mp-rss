@@ -35,14 +35,50 @@ def backoff(cfg, attempts):
     return min(3600, cfg["retry_seconds"] * 2 ** min(attempts - 1, 10))
 
 
+def article_info(article):
+    return {key: article.get(key) if article else None for key in ("title", "mp_id", "mp_name", "url")}
+
+
+def inspect_article(source, state, article_id):
+    article = source.article(article_id)
+    skipped = state.skipped().get(article_id)
+    cached = state.summaries().get(article_id, {})
+    if not article and not skipped and not cached:
+        raise DigestError("没有找到该文章或处理记录，请检查文章 ID")
+    text = clean_html(source.content(article_id)) if article else ""
+    report("article_detail", article_id=article_id, **article_info(article or skipped),
+           source_missing=article is None, content_ready=bool(article and article["ready"]),
+           cleaned_chars=len(text), summarized=bool(cached.get("summary")),
+           skipped=bool(skipped), skip_reason=skipped["reason"] if skipped else None,
+           attempts=cached.get("attempts", 0), last_error=cached.get("last_error"),
+           diagnostics=json.loads(cached.get("usage_json") or "{}"),
+           hint="请打开原文人工确认；只有确认是纯图片时才执行 skip --reason image_only")
+
+
+def skip_article(source, state, article_id, reason, now):
+    article = source.article(article_id)
+    if not article or article["status"] == 1000:
+        raise DigestError("文章不存在或已删除，不能标记为纯图片")
+    if not article["ready"]:
+        raise DigestError("文章尚未抓到正文，请先检查或补抓，不应直接标记为纯图片")
+    if clean_html(source.content(article_id)):
+        raise DigestError("文章当前有可读正文，不允许标记为纯图片跳过")
+    state.skip(article, reason, now)
+    report("article_skipped", article_id=article_id, reason=reason, **article_info(article))
+
+
 def prepare(cfg, source, state, groups, summarizer, now, limit=None, dry_run=False):
     run_started = time.monotonic()
     cache = state.summaries()
+    skipped = state.skipped()
     mp_ids = set().union(*(group["mp_ids"] for group in groups))
     articles = source.articles(mp_ids, float(state.meta("since")))
-    counts = dict(waiting=0, cached=0, calls=0, summarized=0, failed=0, deferred=0, candidates=0)
+    counts = dict(waiting=0, cached=0, calls=0, summarized=0, failed=0, deferred=0, candidates=0, skipped=0)
     limit = limit or cfg["prepare_limit"]
     for article in articles:
+        if article["id"] in skipped:
+            counts["skipped"] += 1
+            continue
         old = cache.get(article["id"], {})
         if old.get("summary"):
             counts["cached"] += 1
@@ -95,7 +131,8 @@ def prepare(cfg, source, state, groups, summarizer, now, limit=None, dry_run=Fal
             completed_at = now + (time.monotonic() - run_started)
             state.failure(article["id"], digest, attempts, str(error), completed_at, backoff(cfg, attempts), details)
             counts["failed"] += 1
-            report("summary_failed", article_id=article["id"], error=str(error), attempts=attempts, **details)
+            report("summary_failed", article_id=article["id"], **article_info(article),
+                   error=str(error), attempts=attempts, **details)
             if getattr(error, "abort_batch", False):
                 report("prepare_aborted", reason="模型配置或访问错误，停止本轮后续调用")
                 break
@@ -132,13 +169,14 @@ def build_parts(group, articles, cache, cfg, now):
 
 def send(cfg, source, state, groups, env, now, sender=send_feishu, dry_run=False, immediate=False):
     cache = state.summaries()
+    skipped = state.skipped()
     by_id = {group["task_id"]: group for group in groups}
     live_ids = {}
     counts = dict(queued=0, sent=0, failed=0, cancelled=0)
     for group in groups:
         group_id = group["task_id"]
         articles = source.articles(group["mp_ids"], float(state.meta("since")))
-        live_ids[group_id] = {article["id"] for article in articles}
+        live_ids[group_id] = {article["id"] for article in articles if article["id"] not in skipped}
         slot = ("manual:" + datetime.fromtimestamp(now, cfg["timezone_obj"]).isoformat()
                 if immediate else due_slot(now, group["push_minutes"], cfg["timezone_obj"],
                                            cfg["schedule_grace_seconds"]))
@@ -146,6 +184,7 @@ def send(cfg, source, state, groups, env, now, sender=send_feishu, dry_run=False
             continue
         used = state.delivered_or_queued(group_id)
         eligible = [article for article in articles if article["id"] not in used
+                    and article["id"] not in skipped
                     and article["ready"] and cache.get(article["id"], {}).get("summary")]
         eligible = eligible[:cfg["max_articles_per_push"]]
         try:
@@ -197,25 +236,39 @@ def send(cfg, source, state, groups, env, now, sender=send_feishu, dry_run=False
 
 def show_status(cfg, source, state, groups):
     cache = state.summaries()
+    skipped = state.skipped()
+    pending_ids = set()
     report("baseline", since=datetime.fromtimestamp(float(state.meta("since")),
                                                    cfg["timezone_obj"]).isoformat())
     for group in groups:
         articles = source.articles(group["mp_ids"], float(state.meta("since")))
         used = state.delivered_or_queued(group["task_id"])
+        pending = {a["id"] for a in articles if a["id"] not in skipped
+                   and not cache.get(a["id"], {}).get("summary")}
+        pending_ids.update(pending)
         report("group_status", task_id=group["task_id"], name=group["name"],
                push_minutes=group["push_minutes"], articles=len(articles),
-               waiting_content=sum(not article["ready"] for article in articles),
+               waiting_content=sum(not a["ready"] and a["id"] not in skipped for a in articles),
+               pending_summary=len(pending), skipped=sum(a["id"] in skipped for a in articles),
                ready_to_send=sum(bool(cache.get(a["id"], {}).get("summary"))
-                                 and a["ready"] and a["id"] not in used for a in articles))
+                                 and a["ready"] and a["id"] not in used
+                                 and a["id"] not in skipped for a in articles))
     for row in state.db.execute("""SELECT article_id, attempts, last_error, usage_json FROM summaries
         WHERE summary IS NULL AND last_error IS NOT NULL"""):
         fields = dict(row)
+        if fields["article_id"] in skipped:
+            continue
+        article = source.article(fields["article_id"])
+        fields.update(article_info(article), source_missing=article is None)
         fields["diagnostics"] = json.loads(fields.pop("usage_json") or "{}")
+        if fields["diagnostics"].get("category") == "empty_content":
+            fields["hint"] = "请打开原文人工确认；纯图片可手动 skip --article 文章ID --reason image_only"
         report("summary_error", **fields)
     for row in state.db.execute("""SELECT id, group_id, attempts, next_retry, last_error
         FROM messages WHERE status='pending'"""):
         report("pending_message", **dict(row))
     report("totals", summaries=sum(bool(row["summary"]) for row in cache.values()),
+           pending_summary=len(pending_ids), skipped=len(skipped),
            sent_messages=state.db.execute("SELECT count(*) FROM messages WHERE status='sent'").fetchone()[0])
 
 
@@ -228,6 +281,14 @@ def main(argv=None):
     initialize = commands.add_parser("init", help="初始化独立状态库，不处理文章")
     initialize.add_argument("--since", help="文章发布时间下限，ISO 时间；默认当前时刻")
     commands.add_parser("status", help="只读查看进度与失败记录")
+    commands.add_parser("skipped", help="只读列出人工跳过的文章")
+    for name in ("inspect", "skip", "unskip"):
+        command = commands.add_parser(name, help={"inspect": "只读查看文章信息与处理状态",
+            "skip": "确认纯图片后手动跳过，不调用模型", "unskip": "撤销跳过并恢复后续检查"}[name])
+        command.add_argument("--article", required=True, help="完整文章 ID")
+        if name == "skip":
+            command.add_argument("--reason", required=True, choices=("image_only",),
+                                 help="填写 image_only 表示已人工确认原文是纯图片")
     for name in ("prepare", "send"):
         command = commands.add_parser(name)
         command.add_argument("--dry-run", action="store_true", help="只预览，不调用模型、不推送、不写状态")
@@ -273,13 +334,23 @@ def main(argv=None):
                 created = State.initialize(cfg["state_dir"], cfg["source_db"], since.timestamp())
             report("state_initialized" if created else "state_exists", note="已有状态库不会重设起始时间或去重记录")
             return 0
-        readonly = args.command == "status" or getattr(args, "dry_run", False)
+        readonly = args.command in ("status", "inspect", "skipped") or getattr(args, "dry_run", False)
         if not (cfg["state_dir"] / "state.sqlite3").exists():
             raise DigestError("请先运行 init 初始化状态库")
         with closing(State(cfg["state_dir"], readonly=readonly)) as state:
             state.verify_source(cfg["source_db"])
             if args.command == "status":
                 show_status(cfg, source, state, groups)
+                return 0
+            if args.command == "inspect":
+                inspect_article(source, state, args.article)
+                return 0
+            if args.command == "skipped":
+                records = state.skipped()
+                for record in records.values():
+                    record["skipped_at"] = datetime.fromtimestamp(record["skipped_at"], cfg["timezone_obj"]).isoformat()
+                    report("skipped_article", **record)
+                report("skipped_total", records=len(records))
                 return 0
             if args.command == "prepare" and args.limit is not None and args.limit <= 0:
                 raise DigestError("--limit 必须为正整数")
@@ -290,6 +361,8 @@ def main(argv=None):
                     send(cfg, source, state, groups, env, now, dry_run=True, immediate=args.now)
                 return 0
             lock = args.command if args.command != "retry" else ("prepare" if args.kind == "summary" else "send")
+            if args.command in ("skip", "unskip"):
+                lock = "prepare"
             with process_lock(cfg["state_dir"], lock) as acquired:
                 if not acquired:
                     report("already_running", command=args.command)
@@ -298,6 +371,12 @@ def main(argv=None):
                     counts = prepare(cfg, source, state, groups, Summarizer(cfg["model"], env), now, args.limit)
                 elif args.command == "send":
                     counts = send(cfg, source, state, groups, env, now, immediate=args.now)
+                elif args.command == "skip":
+                    skip_article(source, state, args.article, args.reason, now)
+                    return 0
+                elif args.command == "unskip":
+                    report("article_unskipped", article_id=args.article, records=state.unskip(args.article, now))
+                    return 0
                 else:
                     report("retry_reset", kind=args.kind, records=state.retry(args.kind))
                     return 0

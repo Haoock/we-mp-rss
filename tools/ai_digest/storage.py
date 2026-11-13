@@ -71,6 +71,15 @@ class Source:
                 (article_id,)).fetchone()
             return row[0] if row else None
 
+    def article(self, article_id):
+        with closing(connect_readonly(self.path)) as db:
+            row = db.execute("""SELECT a.id, a.mp_id, a.title, a.url, a.publish_time,
+                a.status, (a.has_content=1 AND length(trim(a.content))>0) AS ready,
+                coalesce(f.mp_name, a.mp_id) AS mp_name
+                FROM articles a LEFT JOIN feeds f ON a.mp_id=f.id WHERE a.id=?""",
+                (article_id,)).fetchone()
+            return dict(row) if row else None
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -97,6 +106,11 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(status, next_retry);
 """
 
+SKIP_SCHEMA = """CREATE TABLE IF NOT EXISTS skipped_articles (
+    article_id TEXT PRIMARY KEY, title TEXT, mp_id TEXT, mp_name TEXT, url TEXT,
+    reason TEXT NOT NULL, skipped_at REAL NOT NULL, unskipped_at REAL
+)"""
+
 
 class State:
     def __init__(self, directory, readonly=False):
@@ -107,9 +121,16 @@ class State:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA busy_timeout=10000")
         self.db.execute("PRAGMA foreign_keys=ON")
-        if self.meta("schema_version") != "1":
+        version = self.meta("schema_version")
+        if version not in ("1", "2"):
             self.close()
             raise DigestError("状态库版本不受支持")
+        if not readonly and version == "1":
+            # Atomic additive upgrade; read-only commands also work before this upgrade.
+            with self.db:
+                self.db.execute("BEGIN IMMEDIATE")
+                self.db.execute(SKIP_SCHEMA)
+                self.db.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
 
     @staticmethod
     def initialize(directory, source, since):
@@ -122,9 +143,10 @@ class State:
         with closing(sqlite3.connect(str(path), timeout=10)) as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
+            db.execute(SKIP_SCHEMA)
             with db:
                 db.executemany("INSERT INTO meta(key, value) VALUES (?, ?)", [
-                    ("schema_version", "1"), ("source_db", str(Path(source).resolve())), ("since", str(since)),
+                    ("schema_version", "2"), ("source_db", str(Path(source).resolve())), ("since", str(since)),
                 ])
         path.chmod(0o600)
         return True
@@ -142,6 +164,35 @@ class State:
 
     def summaries(self):
         return {row["article_id"]: dict(row) for row in self.db.execute("SELECT * FROM summaries")}
+
+    def skipped(self):
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='skipped_articles'").fetchone():
+            return {}
+        return {row["article_id"]: dict(row) for row in self.db.execute(
+            "SELECT * FROM skipped_articles WHERE unskipped_at IS NULL ORDER BY skipped_at, article_id")}
+
+    def skip(self, article, reason, now):
+        with self.db:
+            row = self.db.execute("SELECT summary FROM summaries WHERE article_id=?", (article["id"],)).fetchone()
+            if row and row[0]:
+                raise DigestError("文章已有成功摘要，不允许标记为纯图片跳过")
+            self.db.execute("""INSERT INTO skipped_articles
+                (article_id, title, mp_id, mp_name, url, reason, skipped_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(article_id) DO UPDATE SET title=excluded.title,
+                    mp_id=excluded.mp_id, mp_name=excluded.mp_name, url=excluded.url,
+                    reason=excluded.reason, skipped_at=excluded.skipped_at, unskipped_at=NULL""",
+                (article["id"], article["title"], article["mp_id"], article["mp_name"],
+                 article["url"], reason, now))
+
+    def unskip(self, article_id, now):
+        with self.db:
+            cursor = self.db.execute("""UPDATE skipped_articles SET unskipped_at=?
+                WHERE article_id=? AND unskipped_at IS NULL""", (now, article_id))
+            if cursor.rowcount:
+                self.db.execute("""UPDATE summaries SET attempts=0, next_retry=0,
+                    last_error=NULL, usage_json=NULL WHERE article_id=? AND summary IS NULL""", (article_id,))
+            return cursor.rowcount
 
     def success(self, article_id, input_hash, summary, usage, now):
         with self.db:
@@ -212,6 +263,8 @@ class State:
         with self.db:
             if kind == "summary":
                 return self.db.execute("""UPDATE summaries SET attempts=0, next_retry=0,
-                    last_error=NULL, usage_json=NULL WHERE summary IS NULL""").rowcount
+                    last_error=NULL, usage_json=NULL WHERE summary IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM skipped_articles s
+                        WHERE s.article_id=summaries.article_id AND s.unskipped_at IS NULL)""").rowcount
             return self.db.execute("""UPDATE messages SET attempts=0, next_retry=0,
                 last_error=NULL WHERE status='pending'""").rowcount

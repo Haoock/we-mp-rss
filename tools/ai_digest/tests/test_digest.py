@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import DigestError, clean_html, due_slot, load_config, load_env, process_lock
-from digest import active_groups, main, payload_size, prepare, send
+from digest import active_groups, inspect_article, main, payload_size, prepare, send, show_status, skip_article
 from providers import ModelError, Summarizer, TransportError, post_json, send_feishu
 from storage import Source, State, connect_readonly
 
@@ -97,6 +97,143 @@ class DigestTests(unittest.TestCase):
         result = self.run_prepare()
         self.assertEqual(result["waiting"], 1)
         self.assertEqual(self.model.calls, [])
+
+    def events(self):
+        return [json.loads(line) for line in self.output.getvalue().splitlines() if line.startswith('{')]
+
+    def test_empty_article_displays_metadata_until_manually_skipped(self):
+        self.article("image", body='<p><img src="https://example.com/picture.png"></p>')
+        self.run_prepare()
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(self.state.skipped(), {})
+        show_status(self.cfg, self.source, self.state, self.groups)
+        error = next(e for e in self.events() if e["event"] == "summary_error")
+        self.assertEqual(error["title"], "标题image")
+        self.assertEqual(error["mp_name"], "公众号A")
+        self.assertEqual(error["url"], "https://example.com/article/image")
+        self.assertIn("人工确认", error["hint"])
+        inspect_article(self.source, self.state, "image")
+        detail = self.events()[-1]
+        self.assertEqual(detail["cleaned_chars"], 0)
+        self.assertFalse(detail["skipped"])
+
+    def test_manual_skip_persists_ignores_retry_and_suppresses_error_and_send(self):
+        self.article("image", body='<img src="picture.png">')
+        self.run_prepare()
+        source_before = hashlib.sha256(self.source_path.read_bytes()).digest()
+        skip_article(self.source, self.state, "image", "image_only", self.at(10, 24))
+        original = self.state.summaries()["image"]
+        self.assertEqual(self.state.retry("summary"), 0)
+        self.assertEqual(self.state.summaries()["image"], original)
+        with closing(State(self.cfg["state_dir"])) as state:
+            self.assertEqual(state.skipped()["image"]["reason"], "image_only")
+            result = prepare(self.cfg, self.source, state, self.groups, self.model, self.at(11, 22))
+            self.assertEqual(result["skipped"], 1)
+            self.assertEqual(result["calls"], 0)
+            self.output.seek(0)
+            self.output.truncate()
+            show_status(self.cfg, self.source, state, self.groups)
+            self.assertFalse(any(e["event"] == "summary_error" for e in self.events()))
+        self.run_send()
+        self.assertEqual(self.messages, [])
+        self.assertEqual(self.state.delivered_or_queued("tech"), set())
+        self.assertEqual(source_before, hashlib.sha256(self.source_path.read_bytes()).digest())
+        # Changed HTML does not override a deliberate human skip.
+        self.db.execute("UPDATE articles SET content='<p>后来补充的文字</p>' WHERE id='image'")
+        self.db.commit()
+        self.run_prepare()
+        self.assertEqual(self.model.calls, [])
+
+    def test_unskip_restores_eligibility_without_calling_model(self):
+        self.article("image", body='<img src="picture.png">')
+        self.run_prepare()
+        skip_article(self.source, self.state, "image", "image_only", self.at(10, 24))
+        self.assertEqual(self.state.unskip("image", self.at(10, 26)), 1)
+        self.assertEqual(self.state.unskip("image", self.at(10, 27)), 0)
+        self.assertFalse(self.state.skipped())
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(self.state.summaries()["image"]["attempts"], 0)
+        self.assertIsNotNone(self.state.db.execute("SELECT unskipped_at FROM skipped_articles").fetchone()[0])
+        self.db.execute("UPDATE articles SET content='<p>已补齐可读正文</p>' WHERE id='image'")
+        self.db.commit()
+        self.run_prepare(28)
+        self.assertEqual(len(self.model.calls), 1)
+
+    def test_skip_rejects_unknown_waiting_and_text_articles(self):
+        self.article("text")
+        self.article("waiting", ready=False)
+        self.article("already_summarized", body='<img src="picture.png">')
+        self.state.success("already_summarized", "hash", SUMMARY, {}, self.at(10, 20))
+        for article_id in ("missing", "text", "waiting", "already_summarized"):
+            with self.assertRaises(DigestError):
+                skip_article(self.source, self.state, article_id, "image_only", self.at(10, 24))
+        self.assertFalse(self.state.skipped())
+
+    def test_pending_summary_counts_failures_waiting_and_unique_totals(self):
+        self.article("waiting", ready=False)
+        self.article("new", mp="B")
+        self.article("failed", mp="C")
+        self.article("blocked", mp="D")
+        self.article("image", body='<img src="picture.png">')
+        self.article("done", mp="G")
+        self.article("unselected", mp="Z")
+        self.state.failure("failed", "hash", 3, "格式失败", self.at(10, 20), 120)
+        self.state.failure("blocked", "hash", 1, "输出上限", self.at(10, 20), 120, {"blocked": True})
+        self.state.success("done", "hash", SUMMARY, {}, self.at(10, 20))
+        skip_article(self.source, self.state, "image", "image_only", self.at(10, 24))
+        self.db.execute("UPDATE message_tasks SET mps_id=? WHERE id='ai'", (json.dumps([{"id": "A"}, {"id": "G"}]),))
+        self.db.commit()
+        self.groups = active_groups(self.cfg, self.source)
+        show_status(self.cfg, self.source, self.state, self.groups)
+        groups = {e["task_id"]: e for e in self.events() if e["event"] == "group_status"}
+        self.assertEqual(groups["tech"]["pending_summary"], 3)
+        self.assertEqual(groups["tech"]["waiting_content"], 1)
+        self.assertEqual(groups["tech"]["skipped"], 1)
+        self.assertEqual(groups["ai"]["pending_summary"], 1)
+        self.assertEqual(groups["stock"]["pending_summary"], 1)
+        totals = self.events()[-1]
+        self.assertEqual(totals["pending_summary"], 4)  # A occurs in two groups, count once.
+        self.assertEqual(totals["skipped"], 1)
+
+    def test_old_state_readonly_then_additive_upgrade_preserves_records(self):
+        self.article("done")
+        self.run_prepare()
+        self.run_send()
+        with self.state.db:
+            self.state.db.execute("DROP TABLE skipped_articles")
+            self.state.db.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+        with closing(State(self.cfg["state_dir"], readonly=True)) as state:
+            self.assertFalse(state.skipped())
+            show_status(self.cfg, self.source, state, self.groups)
+            self.assertEqual(state.meta("schema_version"), "1")
+        with closing(State(self.cfg["state_dir"])) as state:
+            self.assertEqual(state.meta("schema_version"), "2")
+            self.assertEqual(state.summaries()["done"]["summary"], SUMMARY)
+            self.assertEqual(state.delivered_or_queued("tech"), {"done"})
+            self.assertEqual(state.meta("since"), str(self.at(9, 0)))
+
+    def test_cli_skip_inspect_list_unskip_and_missing_source_snapshot(self):
+        self.article("image", body='<img src="picture.png">')
+        args = ["--config", str(self.config_path)]
+        for command in (["inspect", "--article", "image"],
+                        ["skip", "--article", "image", "--reason", "image_only"], ["skipped"]):
+            self.assertEqual(main(args + command), 0, self.output.getvalue())
+        self.db.execute("DELETE FROM articles WHERE id='image'")
+        self.db.commit()
+        self.assertEqual(main(args + ["inspect", "--article", "image"]), 0)
+        detail = self.events()[-1]
+        self.assertTrue(detail["source_missing"])
+        self.assertTrue(detail["skipped"])
+        self.assertEqual(detail["title"], "标题image")
+        self.assertEqual(main(args + ["unskip", "--article", "image"]), 0)
+
+    def test_skip_respects_prepare_lock(self):
+        self.article("image", body='<img src="picture.png">')
+        with process_lock(self.cfg["state_dir"], "prepare"):
+            result = main(["--config", str(self.config_path), "skip", "--article", "image", "--reason", "image_only"])
+            self.assertEqual(result, 0)
+            self.assertEqual(self.events()[-1]["event"], "already_running")
+            self.assertFalse(self.state.skipped())
 
     def test_schedules_grouping_and_restart_dedup(self):
         self.article("a")
